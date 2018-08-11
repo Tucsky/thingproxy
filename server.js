@@ -25,7 +25,7 @@ if (process.env.pmx) {
 	});
 
 	METRICS.average_delay = probe.histogram({
-		name: 'latency',
+		name: 'Average delay',
 		measurement: 'mean'
 	});
 }
@@ -232,7 +232,7 @@ const server = http.createServer(function(req, res) {
 	}
 
 	if (METRICS.average_delay) {
-		METRICS.average_delay.update(req.delay);
+		METRICS.average_delay.update(req.delay / 1000);
 	}
 	
 	if (config.enable_logging) {
