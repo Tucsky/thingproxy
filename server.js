@@ -188,7 +188,7 @@ function processRequest(req, res) {
 	});
 }
 
-http.createServer(function(req, res) {
+const server = http.createServer(function(req, res) {
 	const now = +new Date();
 
 	try {
@@ -240,10 +240,17 @@ http.createServer(function(req, res) {
 		console.log('%s %s %s with %s delay', req.ip, req.method, req.target.href, req.delay);
 	}
 
+	const timeout = setTimeout(() => {
+		REQUESTS[req.target.hostname]--;
+		CLIENTS[req.ip].count--;
+	}, 10000 + req.delay)
+
 	processRequest(req, res)
 		.then()
 		.catch(err => {})
 		.then(() => {
+			clearTimeout(timeout);
+
 			setTimeout(() => {
 				REQUESTS[req.target.hostname]--;
 				CLIENTS[req.ip].count--;
