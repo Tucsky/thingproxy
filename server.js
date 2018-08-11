@@ -1,200 +1,254 @@
-var http = require('http');
-var https = require('https');
-var config = require("./config");
-var url = require("url");
-var request = require("request");
-var cluster = require('cluster');
-var throttle = require("tokenthrottle")({rate: config.max_requests_per_second});
+const http = require('http');
+const url = require('url');
+const request = require('request');
+const resolveHostname = require('public-address');
 
-http.globalAgent.maxSockets = Infinity;
-https.globalAgent.maxSockets = Infinity;
+const config = Object.assign({
+	port: process.env.PORT,
+}, require('./config'));
 
-var publicAddressFinder = require("public-address");
-var publicIP;
+const pmx = require('pmx');
+const probe = pmx.probe();
 
-// Get our public IP address
-publicAddressFinder(function (err, data) {
-    if (!err && data) {
-        publicIP = data.address;
-    }
+let SERVERIP;
+let REQUESTS = {};
+let CLIENTS = {};
+let METRICS = {};
+
+if (process.env.pmx) {
+	METRICS.stored_clients = probe.metric({
+		name: 'Stored clients',
+		agg_type: 'max',
+		value: () => {
+			return Object.keys(CLIENTS).length;
+		}
+	});
+
+	METRICS.average_delay = probe.histogram({
+		name: 'latency',
+		measurement: 'mean'
+	});
+}
+
+if (config.enable_rate_limiting) {
+
+	/* Cleanup expired rate limit data after 1h of inactivity
+	*/
+
+	setInterval(() => { 
+		const now = +new Date();
+
+		for (client in CLIENTS) {
+			if (!client.count || now - client.timestamp > 1000 * 60 * 60) {
+				delete CLIENTS[client];
+			}
+		}
+	}, 1000 * 60);
+}
+
+resolveHostname(function (err, data) {
+	if (!err && data) {
+		SERVERIP = data.address;
+	}
 });
 
 function addCORSHeaders(req, res) {
-    if (req.method.toUpperCase() === "OPTIONS") {
-        if (req.headers["access-control-request-headers"]) {
-            res.setHeader("Access-Control-Allow-Headers", req.headers["access-control-request-headers"]);
-        }
+	if (req.method.toUpperCase() === 'OPTIONS') {
+		if (req.headers['access-control-request-headers']) {
+			res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers']);
+		}
 
-        if (req.headers["access-control-request-method"]) {
-            res.setHeader("Access-Control-Allow-Methods", req.headers["access-control-request-method"]);
-        }
-    }
+		if (req.headers['access-control-request-method']) {
+			res.setHeader('Access-Control-Allow-Methods', req.headers['access-control-request-method']);
+		}
+	}
 
-    if (req.headers["origin"]) {
-        res.setHeader("Access-Control-Allow-Origin", req.headers["origin"]);
-    }
-    else {
-        res.setHeader("Access-Control-Allow-Origin", "*");
-    }
+	if (req.headers['origin']) {
+		res.setHeader('Access-Control-Allow-Origin', req.headers['origin']);
+	}
+	else {
+		res.setHeader('Access-Control-Allow-Origin', '*');
+	}
 }
 
 function writeResponse(res, httpCode, body) {
-    res.statusCode = httpCode;
-    res.end(body);
+	res.statusCode = httpCode;
+	res.end(body);
 }
 
 function sendInvalidURLResponse(res) {
-    return writeResponse(res, 404, "url must be in the form of /fetch/{some_url_here}");
+	return writeResponse(res, 404);
 }
 
 function sendTooBigResponse(res) {
-    return writeResponse(res, 413, "the content in the request or response cannot exceed " + config.max_request_length + " characters.");
+	return writeResponse(res, 413, `the content in the request or response cannot exceed ${config.max_request_length} characters.`);
 }
 
 function getClientAddress(req) {
-    return (req.headers['x-forwarded-for'] || '').split(',')[0]
-        || req.connection.remoteAddress;
+	return (req.headers['x-forwarded-for'] || '').split(',')[0] || req.connection.remoteAddress;
 }
 
 function processRequest(req, res) {
-    addCORSHeaders(req, res);
+	return new Promise((resolve, reject) => {
+		setTimeout(() => {
+			addCORSHeaders(req, res);
 
-    // Return options pre-flight requests right away
-    if (req.method.toUpperCase() === "OPTIONS") {
-        return writeResponse(res, 204);
-    }
+			// return options pre-flight requests right away
+			if (req.method.toUpperCase() === 'OPTIONS') {
+				return reject(writeResponse(res, 204));
+			}
 
-    var result = config.fetch_regex.exec(req.url);
+			// we don't support relative links
+			if (!req.target.host) {
+				return reject(writeResponse(res, 404, `relative URLS are not supported`));
+			}
 
-    if (result && result.length == 2 && result[1]) {
-        var remoteURL;
+			// is origin's hostname blacklisted
+			if (config.blacklist_hostname_regex.test(req.target.hostname)) {
+				return reject(writeResponse(res, 400, `naughty, naughty...`));
+			}
 
-        try {
-            remoteURL = url.parse(decodeURI(result[1]));
-        }
-        catch (e) {
-            return sendInvalidURLResponse(res);
-        }
+			// is req.target's hostname whitelisted 
+			if (!config.whitelist_hostname_regex.test(req.target.hostname)) {
+				return reject(writeResponse(res, 400, `naughty, naughty...`));
+			}
 
-        // We don't support relative links
-        if (!remoteURL.host) {
-            return writeResponse(res, 404, "relative URLS are not supported");
-        }
 
-        // Naughty, naughty— deny requests to blacklisted hosts
-        if (config.blacklist_hostname_regex.test(remoteURL.hostname)) {
-            return writeResponse(res, 400, "naughty, naughty...");
-        }
+			// ensure that protocol is either http or https
+			if (req.target.protocol != 'http:' && req.target.protocol !== 'https:') {
+				return reject(writeResponse(res, 400, `only http and https are supported`));
+			}
 
-        // We only support http and https
-        if (remoteURL.protocol != "http:" && remoteURL.protocol !== "https:") {
-            return writeResponse(res, 400, "only http and https are supported");
-        }
+			// add an x-forwarded-for header
+			if (SERVERIP) {
+				if (req.headers['x-forwarded-for']) {
+					req.headers['x-forwarded-for'] += ', ' + SERVERIP;
+				}
+				else {
+					req.headers['x-forwarded-for'] = req.ip + ', ' + SERVERIP;
+				}
+			}
 
-        if (publicIP) {
-            // Add an X-Forwarded-For header
-            if (req.headers["x-forwarded-for"]) {
-                req.headers["x-forwarded-for"] += ", " + publicIP;
-            }
-            else {
-                req.headers["x-forwarded-for"] = req.clientIP + ", " + publicIP;
-            }
-        }
+			// make sure the host header is to the URL we're requesting, not thingproxy
+			if (req.headers['host']) {
+				req.headers['host'] = req.target.host;
+			}
 
-        // Make sure the host header is to the URL we're requesting, not thingproxy
-        if (req.headers["host"]) {
-            req.headers["host"] = remoteURL.host;
-        }
+			// make sure origin is unset just as a direct request
+			delete req.headers['origin'];
 
-        var proxyRequest = request({
-            url: remoteURL,
-            headers: req.headers,
-            method: req.method,
-            timeout: config.proxy_request_timeout_ms,
-            strictSSL: false
-        });
+			// create the actual proxy request
+			var proxyRequest = request({
+				url: req.target,
+				method: req.method,
+				headers: req.headers,
+				timeout: config.proxy_request_timeout_ms,
+			}, () => {
+				resolve();
+			});
 
-        proxyRequest.on('error', function (err) {
+			// head result error
+			proxyRequest.on('error', function (err) {
+				if (err.code === 'ENOTFOUND') {
+					return reject(writeResponse(res, 502, `Host for ${req.target.href} cannot be found.`))
+				} else {
+					console.error(`Proxy Request Error (${req.target.href}): ${err.toString()}`);
+					return reject(writeResponse(res, 500));
+				}
+			});
 
-            if (err.code === "ENOTFOUND") {
-                return writeResponse(res, 502, "Host for " + url.format(remoteURL) + " cannot be found.")
-            }
-            else {
-                console.log("Proxy Request Error (" + url.format(remoteURL) + "): " + err.toString());
-                return writeResponse(res, 500);
-            }
+			let contentLength = 0;
+			let proxyContentLength = 0;
 
-        });
+			req.pipe(proxyRequest).on('data', function (data) {
+				contentLength += data.length;
 
-        var requestSize = 0;
-        var proxyResponseSize = 0;
+				if (contentLength >= config.max_request_length) {
+					proxyRequest.end();
+					return reject(sendTooBigResponse(res))
+				}
+			}).on('error', function (err) {
+				reject(writeResponse(res, 500, 'Stream Error'));
+			});
 
-        req.pipe(proxyRequest).on('data', function (data) {
+			proxyRequest.pipe(res).on('data', function (data) {
 
-            requestSize += data.length;
+				proxyContentLength += data.length;
 
-            if (requestSize >= config.max_request_length) {
-                proxyRequest.end();
-                return sendTooBigResponse(res);
-            }
-        }).on('error', function(err){
-            writeResponse(res, 500, "Stream Error");
-        });
+				if (proxyContentLength >= config.max_request_length) {
+					proxyRequest.end();
+					return reject(sendTooBigResponse(res));
+				}
 
-        proxyRequest.pipe(res).on('data', function (data) {
-
-            proxyResponseSize += data.length;
-
-            if (proxyResponseSize >= config.max_request_length) {
-                proxyRequest.end();
-                return sendTooBigResponse(res);
-            }
-        }).on('error', function(err){
-            writeResponse(res, 500, "Stream Error");
-        });
-    }
-    else {
-        return sendInvalidURLResponse(res);
-    }
+				console.log('data, ' + contentLength);
+			}).on('error', function (err) {
+				reject(writeResponse(res, 500, 'Stream Error'));
+			});
+		}, req.delay);
+	});
 }
 
-if (cluster.isMaster) {
-    for (var i = 0; i < config.cluster_process_count; i++) {
-        cluster.fork();
-    }
-}
-else
-{
-    http.createServer(function (req, res) {
+http.createServer(function(req, res) {
+	const now = +new Date();
 
-        // Process AWS health checks
-        if (req.url === "/health") {
-            return writeResponse(res, 200);
-        }
+	try {
+		req.target = url.parse(decodeURI(req.url.replace(/^\//, '')));
 
-        var clientIP = getClientAddress(req);
+		if (!req.target || !req.target.href) {
+			throw `Unable to parse url`;
+		}
+	} catch (e) {
+		return sendInvalidURLResponse(res);
+	}
 
-        req.clientIP = clientIP;
+	req.ip = getClientAddress(req);
+	
+	if (config.enable_rate_limiting) {
+		if (!CLIENTS[req.ip]) {
+			CLIENTS[req.ip] = {
+				timestamp: now,
+				count: 0,
+			}
+		}
 
-        // Log our request
-        if (config.enable_logging) {
-            console.log("%s %s %s", (new Date()).toJSON(), clientIP, req.method, req.url);
-        }
+		if (!REQUESTS[req.target.hostname]) {
+			REQUESTS[req.target.hostname] = 0;
+		}
 
-        if (config.enable_rate_limiting) {
-            throttle.rateLimit(clientIP, function (err, limited) {
-                if (limited) {
-                    return writeResponse(res, 429, "enhance your calm");
-                }
+		if (CLIENTS[req.ip].count >= config.max_simultaneous_requests_per_ip) {
+			if (config.enable_logging) {
+				console.log('%s got timeout', req.ip);
+			}
 
-                processRequest(req, res);
-            })
-        }
-        else {
-            processRequest(req, res);
-        }
+			return writeResponse(res, 429, `enhance your calm`);
+		}
 
-    }).listen(config.port);
+		req.delay = REQUESTS[req.target.hostname] * config.increment_timeout_by + CLIENTS[req.ip].count * config.increment_timeout_by;
+	
+		CLIENTS[req.ip]++;
 
-    console.log("thingproxy.freeboard.io process started (PID " + process.pid + ")");
-}
+		REQUESTS[req.target.hostname]++;
+	} else {
+		req.delay = 0;
+	}
+
+	if (METRICS.average_delay) {
+		METRICS.average_delay.update(req.delay);
+	}
+	
+	if (config.enable_logging) {
+		console.log('%s %s %s with %s delay', req.ip, req.method, req.target.href, req.delay);
+	}
+
+	processRequest(req, res)
+		.then()
+		.catch(err => {})
+		.then(() => {
+			setTimeout(() => {
+				REQUESTS[req.target.hostname]--;
+				CLIENTS[req.ip].count--;
+			}, 2000);
+		})
+}).listen(config.port);
+
+console.log('thingproxy.freeboard.io process started (PID ' + process.pid + ')');

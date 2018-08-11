@@ -1,9 +1,28 @@
-exports.port = process.env.PORT || 3000;
-exports.enable_logging = false;
-exports.fetch_regex = /^\/fetch\/(.*)$/; // The URL to look for when parsing the request.
-exports.proxy_request_timeout_ms = 10000; // The lenght of time we'll wait for a proxy server to respond before timing out.
-exports.max_request_length = 100000; // The maximum length of characters allowed for a request or a response.
-exports.enable_rate_limiting = true;
-exports.max_requests_per_second = 10; // The maximum number of requests per second to allow from a given IP.
-exports.blacklist_hostname_regex = /^(10\.|192\.|127\.|localhost$)/i; // Good for limiting access to internal IP addresses and hosts.
-exports.cluster_process_count = Number(process.env.CLUSTER_PROCESS_COUNT) || require("os").cpus().length;
+module.exports = {
+	port: process.env.PORT || 3000,
+	enable_logging: true,
+	max_request_length: 1000000,
+	enable_rate_limiting: true,
+
+	// a timeout is applied to each hostname / ip specific request
+	increment_timeout_by: 1500, 
+
+	// if there is 10+ simultaneous request from 1 ip the error 429 is returned
+	max_simultaneous_requests_per_ip: 10, 
+	whitelist_hostname_regex: new RegExp(`^(${[
+		'api.kraken.com',
+		'api.binance.com',
+		'api.bitfinex.com',
+		'api.gdax.com',
+		'api.pro.coinbase.com',
+		'api.prime.coinbase.com',
+		'www.bitstamp.net',
+		'api.hitbtc.com',
+		'poloniex.com',
+		'www.okex.com',
+		'api.huobi.pro',
+		'www.bitmex.com',
+		'api.coinex.com',
+	].join('|')})$`),
+	blacklist_hostname_regex: /^(10\.|192\.|127\.|localhost$)/i, // Good for limiting access to internal IP addresses and hosts.
+};
