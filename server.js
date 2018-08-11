@@ -225,8 +225,7 @@ const server = http.createServer(function(req, res) {
 
 		req.delay = REQUESTS[req.target.hostname] * config.increment_timeout_by + CLIENTS[req.ip].count * config.increment_timeout_by;
 	
-		CLIENTS[req.ip]++;
-
+		CLIENTS[req.ip].count++;
 		REQUESTS[req.target.hostname]++;
 	} else {
 		req.delay = 0;
