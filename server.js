@@ -39,7 +39,7 @@ if (config.enable_rate_limiting) {
 		const now = +new Date();
 
 		for (client in CLIENTS) {
-			if (!client.count || now - client.timestamp > 1000 * 60 * 60) {
+			if (!CLIENTS[client].count || now - client.timestamp > 1000 * 60 * 60) {
 				delete CLIENTS[client];
 			}
 		}
