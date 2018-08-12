@@ -1,6 +1,6 @@
 const http = require('http');
+const https = require('https');
 const url = require('url');
-const request = require('request');
 const resolveHostname = require('public-address');
 
 const config = Object.assign({
@@ -80,111 +80,108 @@ function sendInvalidURLResponse(res) {
 	return writeResponse(res, 404);
 }
 
-function sendTooBigResponse(res) {
-	return writeResponse(res, 413, `the content in the request or response cannot exceed ${config.max_request_length} characters.`);
-}
-
 function getClientAddress(req) {
 	return (req.headers['x-forwarded-for'] || '').split(',')[0] || req.connection.remoteAddress;
 }
 
-function processRequest(req, res) {
+function doProxyRequest(req, mainResponse) {
+  req.pause();
+
 	return new Promise((resolve, reject) => {
+		addCORSHeaders(req, mainResponse);
+
+		req.target.headers = req.headers;
+		req.target.method = req.method;
+		req.target.agent = false;
+
+		// return options pre-flight requests right away
+		if (req.method.toUpperCase() === 'OPTIONS') {
+			return reject(writeResponse(mainResponse, 204));
+		}
+
+		// we don't support relative links
+		if (!req.target.host) {
+			return reject(writeResponse(mainResponse, 404, `relative URLS are not supported`));
+		}
+
+		// is origin's hostname blacklisted
+		if (config.blacklist_hostname_regex.test(req.target.hostname)) {
+			return reject(writeResponse(mainResponse, 400, `naughty, naughty...`));
+		}
+
+		// is req.target's hostname whitelisted 
+		if (!config.whitelist_hostname_regex.test(req.target.hostname)) {
+			return reject(writeResponse(mainResponse, 400, `naughty, naughty...`));
+		}
+
+
+		// ensure that protocol is either http or https
+		if (req.target.protocol != 'http:' && req.target.protocol !== 'https:') {
+			return reject(writeResponse(mainResponse, 400, `only http and https are supported`));
+		}
+
+		// add an x-forwarded-for header
+		if (SERVERIP) {
+			if (req.target.headers['x-forwarded-for']) {
+				req.target.headers['x-forwarded-for'] += ', ' + SERVERIP;
+			}
+			else {
+				req.target.headers['x-forwarded-for'] = req.ip + ', ' + SERVERIP;
+			}
+		}
+
+		// make sure the host header is to the URL we're requesting, not thingproxy
+		if (req.target.headers['host']) {
+			req.target.headers['host'] = req.target.host;
+		}
+
+		// make sure origin is unset just as a direct request
+		delete req.target.headers['origin'];
+
+		var connector = (req.target.protocol == 'https:' ? https : http).request(req.target, function(targetResponse) {
+			targetResponse.pause();
+
+			delete targetResponse.headers['set-cookie'];
+
+			switch (targetResponse.statusCode) {
+				// pass through.  we're not too smart here...
+				case 200: case 201: case 202: case 203: case 204: case 205: case 206:
+				case 304:
+				case 400: case 401: case 402: case 403: case 404: case 405:
+				case 406: case 407: case 408: case 409: case 410: case 411:
+				case 412: case 413: case 414: case 415: case 416: case 417: case 418:
+					mainResponse.writeHeader(targetResponse.statusCode, targetResponse.headers);
+					targetResponse.pipe(mainResponse, {end:true});
+					targetResponse.resume();
+				break;
+
+				// fix host and pass through.  
+				case 301:
+				case 302:
+				case 303:
+					targetResponse.statusCode = 303;
+					targetResponse.headers['location'] = 'http://localhost:'+ config.port +'/'+targetResponse.headers['location'];
+					mainResponse.writeHeader(targetResponse.statusCode, targetResponse.headers);
+					targetResponse.pipe(mainResponse, {end:true});
+					targetResponse.resume();
+				break;
+
+				// error everything else
+				default:
+					var stringifiedHeaders = JSON.stringify(targetResponse.headers, null, 4);
+					targetResponse.resume();
+					mainResponse.writeHeader(500);
+					mainResponse.end(process.argv.join(' ') + ':\n\nError ' + targetResponse.statusCode + '\n' + stringifiedHeaders);
+				break;
+			}
+
+			resolve();
+		});
+
 		setTimeout(() => {
-			addCORSHeaders(req, res);
-
-			// return options pre-flight requests right away
-			if (req.method.toUpperCase() === 'OPTIONS') {
-				return reject(writeResponse(res, 204));
-			}
-
-			// we don't support relative links
-			if (!req.target.host) {
-				return reject(writeResponse(res, 404, `relative URLS are not supported`));
-			}
-
-			// is origin's hostname blacklisted
-			if (config.blacklist_hostname_regex.test(req.target.hostname)) {
-				return reject(writeResponse(res, 400, `naughty, naughty...`));
-			}
-
-			// is req.target's hostname whitelisted 
-			if (!config.whitelist_hostname_regex.test(req.target.hostname)) {
-				return reject(writeResponse(res, 400, `naughty, naughty...`));
-			}
-
-
-			// ensure that protocol is either http or https
-			if (req.target.protocol != 'http:' && req.target.protocol !== 'https:') {
-				return reject(writeResponse(res, 400, `only http and https are supported`));
-			}
-
-			// add an x-forwarded-for header
-			if (SERVERIP) {
-				if (req.headers['x-forwarded-for']) {
-					req.headers['x-forwarded-for'] += ', ' + SERVERIP;
-				}
-				else {
-					req.headers['x-forwarded-for'] = req.ip + ', ' + SERVERIP;
-				}
-			}
-
-			// make sure the host header is to the URL we're requesting, not thingproxy
-			if (req.headers['host']) {
-				req.headers['host'] = req.target.host;
-			}
-
-			// make sure origin is unset just as a direct request
-			delete req.headers['origin'];
-
-			// create the actual proxy request
-			var proxyRequest = request({
-				url: req.target,
-				method: req.method,
-				headers: req.headers,
-				timeout: config.proxy_request_timeout_ms,
-			}, () => {
-				resolve();
-			});
-
-			// head result error
-			proxyRequest.on('error', function (err) {
-				if (err.code === 'ENOTFOUND') {
-					return reject(writeResponse(res, 502, `Host for ${req.target.href} cannot be found.`))
-				} else {
-					console.error(`Proxy Request Error (${req.target.href}): ${err.toString()}`);
-					return reject(writeResponse(res, 500));
-				}
-			});
-
-			let contentLength = 0;
-			let proxyContentLength = 0;
-
-			req.pipe(proxyRequest).on('data', function (data) {
-				contentLength += data.length;
-
-				if (contentLength >= config.max_request_length) {
-					proxyRequest.end();
-					return reject(sendTooBigResponse(res))
-				}
-			}).on('error', function (err) {
-				reject(writeResponse(res, 500, 'Stream Error'));
-			});
-
-			proxyRequest.pipe(res).on('data', function (data) {
-
-				proxyContentLength += data.length;
-
-				if (proxyContentLength >= config.max_request_length) {
-					proxyRequest.end();
-					return reject(sendTooBigResponse(res));
-				}
-
-				console.log('data, ' + contentLength);
-			}).on('error', function (err) {
-				reject(writeResponse(res, 500, 'Stream Error'));
-			});
-		}, req.delay);
+			req.pipe(connector, {end:true});
+			req.resume();
+		}, req.delay)
 	});
 }
 
@@ -234,21 +231,21 @@ const server = http.createServer(function(req, res) {
 	if (METRICS.average_delay) {
 		METRICS.average_delay.update(req.delay / 1000);
 	}
-	
+
 	if (config.enable_logging) {
 		console.log('%s %s %s with %s delay', req.ip, req.method, req.target.href, req.delay);
 	}
-
-	const timeout = setTimeout(() => {
+	
+	const decreaseRateLimitTimeout = setTimeout(() => {
 		REQUESTS[req.target.hostname]--;
 		CLIENTS[req.ip].count--;
 	}, 10000 + req.delay)
 
-	processRequest(req, res)
-		.then()
+	doProxyRequest(req, res)
+		.then(() => {})
 		.catch(err => {})
 		.then(() => {
-			clearTimeout(timeout);
+			clearTimeout(decreaseRateLimitTimeout);
 
 			setTimeout(() => {
 				REQUESTS[req.target.hostname]--;

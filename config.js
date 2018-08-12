@@ -5,7 +5,7 @@ module.exports = {
 	enable_rate_limiting: true,
 
 	// a timeout is applied to each hostname / ip specific request
-	increment_timeout_by: 1500, 
+	increment_timeout_by: 1000, 
 
 	// if there is 10+ simultaneous request from 1 ip the error 429 is returned
 	max_simultaneous_requests_per_ip: 10, 
