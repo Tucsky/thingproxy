@@ -237,8 +237,8 @@ const server = http.createServer(function(req, res) {
 	}
 	
 	const decreaseRateLimitTimeout = setTimeout(() => {
-		REQUESTS[req.target.hostname]--;
-		CLIENTS[req.ip].count--;
+		REQUESTS[req.target.hostname] && REQUESTS[req.target.hostname]--;
+		CLIENTS[req.ip] && CLIENTS[req.ip].count--;
 	}, 10000 + req.delay)
 
 	doProxyRequest(req, res)
@@ -248,8 +248,8 @@ const server = http.createServer(function(req, res) {
 			clearTimeout(decreaseRateLimitTimeout);
 
 			setTimeout(() => {
-				REQUESTS[req.target.hostname]--;
-				CLIENTS[req.ip].count--;
+				REQUESTS[req.target.hostname] && REQUESTS[req.target.hostname]--;
+				CLIENTS[req.ip] && CLIENTS[req.ip].count--;
 			}, 2000);
 		})
 }).listen(config.port);
