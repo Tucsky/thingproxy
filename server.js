@@ -41,7 +41,7 @@ if (config.enable_rate_limiting) {
 		}
 
 		for (key in CACHE) {
-			if (now > cached[key].expiration) {
+			if (now > CACHE[key].expiration) {
 				delete CACHE[key];
 			}
 		}
