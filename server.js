@@ -10,23 +10,19 @@ const config = Object.assign({
 const pmx = require('pmx');
 const probe = pmx.probe();
 
+const EXPIRATION_DURATION = 1000 * 60 * 60 * 1;
+
 let SERVERIP;
 let REQUESTS = {};
 let CLIENTS = {};
 let METRICS = {};
+let CACHE = {};
 
 if (process.env.pmx) {
-	METRICS.stored_clients = probe.metric({
-		name: 'Stored clients',
-		agg_type: 'max',
-		value: () => {
-			return Object.keys(CLIENTS).length;
-		}
-	});
-
-	METRICS.average_delay = probe.histogram({
-		name: 'Average delay',
-		measurement: 'mean'
+	METRICS.req_per_min = probe.meter({
+		name: 'req/min',
+		samples: 1,
+		timeframe: 60
 	});
 }
 
@@ -35,12 +31,18 @@ if (config.enable_rate_limiting) {
 	/* Cleanup expired rate limit data after 1h of inactivity
 	*/
 
-	setInterval(() => { 
+	setInterval(() => {
 		const now = +new Date();
 
 		for (client in CLIENTS) {
 			if (!CLIENTS[client].count || now - client.timestamp > 1000 * 60 * 60) {
 				delete CLIENTS[client];
+			}
+		}
+
+		for (key in CACHE) {
+			if (now > cached[key].expiration) {
+				delete CACHE[key];
 			}
 		}
 	}, 1000 * 60);
@@ -88,8 +90,6 @@ function doProxyRequest(req, mainResponse) {
   req.pause();
 
 	return new Promise((resolve, reject) => {
-		addCORSHeaders(req, mainResponse);
-
 		req.target.headers = req.headers;
 		req.target.method = req.method;
 		req.target.agent = false;
@@ -109,7 +109,7 @@ function doProxyRequest(req, mainResponse) {
 			return reject(writeResponse(mainResponse, 400, `naughty, naughty...`));
 		}
 
-		// is req.target's hostname whitelisted 
+		// is req.target's hostname whitelisted
 		if (!config.whitelist_hostname_regex.test(req.target.hostname)) {
 			return reject(writeResponse(mainResponse, 400, `naughty, naughty...`));
 		}
@@ -138,8 +138,30 @@ function doProxyRequest(req, mainResponse) {
 		// make sure origin is unset just as a direct request
 		delete req.target.headers['origin'];
 
+		req.target.headers['Accept-Encoding'] = 'identity';
+
 		var connector = (req.target.protocol == 'https:' ? https : http).request(req.target, function(targetResponse) {
 			targetResponse.pause();
+
+			let data = [];
+
+			targetResponse.on('data', chunk => {
+				data.push(chunk);
+			});
+
+			targetResponse.on('end', () => {
+				if (targetResponse.statusCode !== 200) {
+					return;
+				}
+
+				console.log(`cache %s until %s`, req.target.href, new Date(+new Date() + EXPIRATION_DURATION).toString());
+
+				CACHE[req.target.href] = {
+					expiration: +new Date() + EXPIRATION_DURATION,
+					type: targetResponse.headers['content-type'],
+					data: Buffer.concat(data)
+				}
+			});
 
 			delete targetResponse.headers['set-cookie'];
 
@@ -155,7 +177,7 @@ function doProxyRequest(req, mainResponse) {
 					targetResponse.resume();
 				break;
 
-				// fix host and pass through.  
+				// fix host and pass through.
 				case 301:
 				case 302:
 				case 303:
@@ -178,6 +200,10 @@ function doProxyRequest(req, mainResponse) {
 			resolve();
 		});
 
+		connector.on('error', (error) => {
+			console.error('Error in piped request', error.message);
+		});
+
 		setTimeout(() => {
 			req.pipe(connector, {end:true});
 			req.resume();
@@ -186,6 +212,10 @@ function doProxyRequest(req, mainResponse) {
 }
 
 const server = http.createServer(function(req, res) {
+	addCORSHeaders(req, res);
+
+	METRICS.req_per_min.mark();
+
 	const now = +new Date();
 
 	try {
@@ -198,8 +228,15 @@ const server = http.createServer(function(req, res) {
 		return sendInvalidURLResponse(res);
 	}
 
+	if (CACHE[req.target.href] && CACHE[req.target.href].data && +new Date() < CACHE[req.target.href].expiration) {
+		res.writeHead(200, {'Content-Type': CACHE[req.target.href].type || 'application/json'});
+		res.end(CACHE[req.target.href].data);
+
+		return;
+	}
+
 	req.ip = getClientAddress(req);
-	
+
 	if (config.enable_rate_limiting) {
 		if (!CLIENTS[req.ip]) {
 			CLIENTS[req.ip] = {
@@ -221,37 +258,37 @@ const server = http.createServer(function(req, res) {
 		}
 
 		req.delay = REQUESTS[req.target.hostname] * config.increment_timeout_by + CLIENTS[req.ip].count * config.increment_timeout_by;
-	
+
 		CLIENTS[req.ip].count++;
 		REQUESTS[req.target.hostname]++;
 	} else {
 		req.delay = 0;
 	}
 
-	if (METRICS.average_delay) {
-		METRICS.average_delay.update(req.delay / 1000);
-	}
-
 	if (config.enable_logging) {
 		console.log('%s %s %s with %s delay', req.ip, req.method, req.target.href, req.delay);
 	}
-	
+
 	const decreaseRateLimitTimeout = setTimeout(() => {
 		REQUESTS[req.target.hostname] && REQUESTS[req.target.hostname]--;
 		CLIENTS[req.ip] && CLIENTS[req.ip].count--;
 	}, 10000 + req.delay)
 
-	doProxyRequest(req, res)
-		.then(() => {})
-		.catch(err => {})
-		.then(() => {
-			clearTimeout(decreaseRateLimitTimeout);
+	try {
+		doProxyRequest(req, res)
+			.then(() => {})
+			.catch(err => {})
+			.then(() => {
+				clearTimeout(decreaseRateLimitTimeout);
 
-			setTimeout(() => {
-				REQUESTS[req.target.hostname] && REQUESTS[req.target.hostname]--;
-				CLIENTS[req.ip] && CLIENTS[req.ip].count--;
-			}, 2000);
-		})
+				setTimeout(() => {
+					REQUESTS[req.target.hostname] && REQUESTS[req.target.hostname]--;
+					CLIENTS[req.ip] && CLIENTS[req.ip].count--;
+				}, 2000);
+			})
+	} catch (error) {
+		console.error('Error in proxy request', error.message);
+	}
 }).listen(config.port);
 
 console.log('thingproxy.freeboard.io process started (PID ' + process.pid + ')');
